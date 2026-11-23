@@ -21,8 +21,12 @@ and no model text is ever executed or treated as an instruction.
 
 The design is deliberately two-sided. A dispute is not one party
 asserting something to a judge: both sides can put a statement and
-evidence on record, and the round can still be resolved if one side
-never responds — silence is judged on the evidence that exists, not
+evidence on record, and the counterparty has 24 hours to answer.
+Until it does, or that window passes, the dispute cannot be resolved
+on the opener's case alone — the payout is never finalized from one
+side's case while the other side is still waiting to be heard. After
+the deadline the round can still be resolved if one side never
+responds — silence is judged on the evidence that exists, not
 rewarded with a default win. A dispute is resolved once; there is no
 appeal, and the escrow cannot be cancelled while a dispute is open.
 
@@ -65,6 +69,13 @@ MAX_AGREEMENT_CHARS = 2000
 MAX_STATEMENT_CHARS = 2000
 MAX_URL_CHARS = 500
 MAX_EVIDENCE_CHARS = 6000
+
+# How long the counterparty has to answer a dispute, in seconds.
+# A dispute cannot be resolved while the other side is still inside
+# this window and has not responded: the opener's case alone never
+# settles the payout. After the deadline the round judges on the
+# record as it stands, so silence cannot stall a dispute forever.
+RESPONSE_WINDOW_SECONDS = u256(86400)
 
 ESCROW_FUNDED = "FUNDED"
 ESCROW_RELEASED = "RELEASED"
@@ -110,6 +121,9 @@ class Dispute:
     # sides have submitted.
     awaiting: Address
     disputed_at: u256
+    # Unix seconds. The counterparty must answer by this time; until
+    # then the dispute cannot be resolved on the opener's case alone.
+    response_deadline: u256
     resolved_at: u256
     # Verdict of the consensus round. The split is computed by
     # deterministic code from these two booleans, never copied from
@@ -402,6 +416,7 @@ def _dispute_to_dict(dispute: Dispute) -> dict:
         "worker_evidence": dispute.worker_evidence,
         "awaiting": dispute.awaiting.as_hex,
         "disputed_at": dispute.disputed_at,
+        "response_deadline": dispute.response_deadline,
         "resolved_at": dispute.resolved_at,
         "delivered": dispute.delivered,
         "met_agreement": dispute.met_agreement,
@@ -567,6 +582,7 @@ class EscrowDisputeMediation(gl.Contract):
             worker_evidence=worker_evidence,
             awaiting=awaiting,
             disputed_at=_now_seconds(),
+            response_deadline=_now_seconds() + RESPONSE_WINDOW_SECONDS,
             resolved_at=u256(0),
             delivered=False,
             met_agreement=False,
@@ -581,8 +597,9 @@ class EscrowDisputeMediation(gl.Contract):
         """Answer a dispute from the side that has not spoken yet.
 
         Only the awaited party may call this, and only once. If that
-        party never responds, the dispute can still be resolved:
-        resolve_dispute judges on the record as it stands.
+        party never responds, the dispute can still be resolved once
+        the 24-hour response deadline passes: resolve_dispute then
+        judges on the record as it stands.
         """
         escrow_id = _as_u256(escrow_id, "escrow id")
         escrow = self._require_escrow(escrow_id)
@@ -606,7 +623,10 @@ class EscrowDisputeMediation(gl.Contract):
         """Run validator consensus on an open dispute and settle it.
 
         Anyone may call this: the caller decides nothing, consensus
-        does. The leader and the validator each fetch both sides'
+        does. Resolution is gated: while the counterparty is still
+        awaited inside its 24-hour response window, the call reverts
+        — either the response arrives or the deadline passes first.
+        The leader and the validator each fetch both sides'
         evidence and judge the same two facts; the round only finalizes
         when both booleans match. After consensus, the split is
         computed by deterministic code from the agreed booleans and
@@ -619,6 +639,20 @@ class EscrowDisputeMediation(gl.Contract):
         dispute = self.disputes[escrow_id]
         if dispute.resolved:
             raise gl.vm.UserError("[EXPECTED] dispute is already resolved")
+
+        # The counterparty gets its say. While it is still awaited
+        # inside its 24-hour response window, the opener's case alone
+        # cannot settle the payout: either the response arrives, or
+        # the deadline passes and the round judges on the record as
+        # it stands.
+        if (
+            dispute.awaiting != Address(bytes(20))
+            and _now_seconds() < dispute.response_deadline
+        ):
+            raise gl.vm.UserError(
+                "[EXPECTED] dispute cannot be resolved before the "
+                "counterparty responds or the response deadline passes"
+            )
 
         # Copy the records out of storage before the nondet block. The
         # leader and validator run in separate VMs and cannot touch
