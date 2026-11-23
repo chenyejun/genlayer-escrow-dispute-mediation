@@ -36,10 +36,13 @@ move money by phrasing.
   side. The other side is then awaited.
 - `submit_response` — the awaited party, once: record the other side's
   statement and evidence URL. If that party never responds, the
-  dispute can still be resolved on the record as it stands.
+  dispute can still be resolved once the 24-hour response deadline
+  passes, on the record as it stands.
 - `resolve_dispute` — anyone may call it; the caller decides nothing.
   Runs validator consensus on the dispute and pays the split out
-  immediately.
+  immediately. Resolution is gated: while the counterparty is still
+  awaited inside its 24-hour response window, the call reverts — the
+  opener's case alone never settles the payout.
 - Views: `get_escrow`, `get_dispute`, `list_escrows`, `stats`.
 
 The split rule, from the two agreed booleans:
@@ -74,17 +77,24 @@ locked amount, the deadline, the status (`FUNDED` / `RELEASED` /
 `DISPUTED` / `RESOLVED` / `CANCELLED`), and the creation time.
 `Dispute` stores the opener, both sides' statements and evidence
 URLs, which side is still awaited (or the zero address once both
-sides have spoken), the dispute and resolution times, the verdict
-(`delivered`, `met_agreement`, `worker_share`, `rationale`), and
-whether it is resolved.
+sides have spoken), the dispute and response-deadline times, the
+verdict (`delivered`, `met_agreement`, `worker_share`, `rationale`),
+and whether it is resolved.
 
-Two rules shape the design. First, the agreement is frozen: nothing in
+Three rules shape the design. First, the agreement is frozen: nothing in
 the contract can edit it after creation, because it is the document
 consensus judges a later dispute against. Second, the dispute record
 is two-sided by construction — the payer's case and the worker's case
 live in separate fields, and a side that never submits leaves its
 fields empty rather than being filled in by the other side. Silence is
-a fact about the record, not a default win.
+a fact about the record, not a default win. Third, the counterparty
+gets its say: opening a dispute starts a 24-hour response window
+(`response_deadline = disputed_at + 86400`), and `resolve_dispute`
+reverts while the other side is still awaited inside that window.
+Only a submitted response, or the deadline passing, opens the gate —
+so a payout is never finalized from one side's case while the other
+side is still waiting to be heard, and silence past the deadline
+cannot stall the dispute forever.
 
 ## How the equivalence check works
 
@@ -124,7 +134,7 @@ function, which is the correct tool for two booleans.
 
 | Prefix | Meaning | Examples | Caller should |
 | --- | --- | --- | --- |
-| `[EXPECTED]` | Bad input or invalid state | Zero worker, payer escrowing to themselves, zero value, past deadline, empty agreement, non-payer releasing or cancelling, cancelling before the deadline, a stranger opening a dispute, responding when not awaited, resolving without an open dispute, a non-HTTP evidence URL | Fix the input or the caller; no retry |
+| `[EXPECTED]` | Bad input or invalid state | Zero worker, payer escrowing to themselves, zero value, past deadline, empty agreement, non-payer releasing or cancelling, cancelling before the deadline, a stranger opening a dispute, responding when not awaited, resolving without an open dispute, resolving while the counterparty is still awaited inside its 24-hour response window, a non-HTTP evidence URL | Fix the input or the caller; no retry (for a gated resolve: wait for the response or the deadline) |
 | `[EXTERNAL]` | The outside world is at fault, deterministically | An evidence URL returned 4xx (page gone, moved, or access denied) or an empty body | Fix the evidence URL — the dispute cannot be resolved until the evidence loads; the dispute itself stays open |
 | `[TRANSIENT]` | The outside world failed, possibly temporarily | An evidence host returned 5xx or 429 | Retry later; nothing was written |
 | `[LLM_ERROR]` | The model answer was unusable | Non-JSON answer, a non-boolean `delivered` or `met`, a missing flag | Retry; the leader rotates, so a persistent failure means the evidence is the problem |
@@ -193,8 +203,11 @@ create a second escrow with a short deadline, wait it out, cancel it,
 and confirm the payer was refunded; then run three disputes — one
 that settles 50/50 (delivered but missing a named part), one that
 settles 100% to the worker (fully delivered), and one that settles 0%
-(nothing delivered, worker never responds) — and confirm the balances
-on the explorer match the splits.
+(nothing delivered) — and confirm the balances
+on the explorer match the splits. The 0% dispute also demonstrates
+the response gate: calling `resolve_dispute` before the worker
+responds (and before the 24-hour response deadline) reverts with
+`[EXPECTED]`.
 
 ## Tests
 
@@ -205,7 +218,10 @@ cover creation and input validation, the Studio-form argument forms
 (worker as an int or a hex string, deadline as a JSON string),
 release (payer only, once), cancel (payer only, after the deadline),
 opening a dispute (either party, stranger rejected, evidence URL
-validation), responding (only the awaited party, once), the three
+validation), responding (only the awaited party, once), the response
+gate (resolving blocked while the counterparty is still awaited,
+allowed immediately after a response, allowed after the 24-hour
+deadline elapses), the three
 settlement outcomes (100 / 50 / 0), validator disagreement on a
 boolean (via mock swapping between leader and replay), evidence
 unreachable (`[EXTERNAL]` for 404, `[TRANSIENT]` for 429), malformed
