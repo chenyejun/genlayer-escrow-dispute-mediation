@@ -238,6 +238,9 @@ def test_open_dispute_records_both_sides(
     assert dispute["payer_evidence"] == EVIDENCE_NOTHING
     assert dispute["worker_statement"] == ""
     assert dispute["awaiting"] == to_hex(direct_bob)
+    # The counterparty has 24 hours to answer, counted from the
+    # dispute itself.
+    assert dispute["response_deadline"] == dispute["disputed_at"] + 86400
     assert dispute["resolved"] is False
     assert contract.get_escrow(escrow_id)["status"] == "DISPUTED"
 
@@ -316,6 +319,98 @@ def _setup_dispute(
     return escrow_id
 
 
+def test_resolve_blocked_while_counterparty_awaited(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """The opener's case alone never settles the payout while the
+    counterparty is still inside its 24-hour response window."""
+    contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
+    escrow_id = _setup_dispute(
+        direct_vm, contract, direct_alice, direct_bob,
+        opener=direct_alice,
+        opener_statement="Nothing was delivered.",
+        opener_url=EVIDENCE_NOTHING,
+    )
+
+    assert contract.get_dispute(escrow_id)["awaiting"] == to_hex(direct_bob)
+    with direct_vm.expect_revert(
+        "[EXPECTED] dispute cannot be resolved before the counterparty responds"
+    ):
+        contract.resolve_dispute(escrow_id)
+    assert contract.get_dispute(escrow_id)["resolved"] is False
+    assert contract.get_escrow(escrow_id)["status"] == "DISPUTED"
+
+    # Same in the other direction: the worker opens, the payer is awaited.
+    second = _setup_dispute(
+        direct_vm, contract, direct_alice, direct_bob,
+        opener=direct_bob,
+        opener_statement="I delivered the page.",
+        opener_url=EVIDENCE_DELIVERED,
+    )
+    assert contract.get_dispute(second)["awaiting"] == to_hex(direct_alice)
+    with direct_vm.expect_revert(
+        "[EXPECTED] dispute cannot be resolved before the counterparty responds"
+    ):
+        contract.resolve_dispute(second)
+
+
+def test_resolve_allowed_immediately_after_response(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Once both sides have spoken, the gate is open with no waiting."""
+    contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
+    escrow_id = _setup_dispute(
+        direct_vm, contract, direct_alice, direct_bob,
+        opener=direct_alice,
+        opener_statement="Nothing was delivered.",
+        opener_url=EVIDENCE_NOTHING,
+        responder=direct_bob,
+        responder_statement="It is done.",
+        responder_url=EVIDENCE_DELIVERED,
+    )
+
+    _mock_evidence(direct_vm, EVIDENCE_NOTHING, PAGE_NOTHING)
+    _mock_evidence(direct_vm, EVIDENCE_DELIVERED, PAGE_DELIVERED)
+    _mock_verdict(direct_vm, False, False)
+    _resolve(direct_vm, contract, escrow_id)
+    assert contract.get_dispute(escrow_id)["resolved"] is True
+    assert contract.get_escrow(escrow_id)["status"] == "RESOLVED"
+
+
+def test_resolve_allowed_after_response_deadline_elapses(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Silence past the deadline does not stall the dispute: the round
+    judges on the record as it stands."""
+    contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
+    escrow_id = _setup_dispute(
+        direct_vm, contract, direct_alice, direct_bob,
+        opener=direct_alice,
+        opener_statement="Nothing was delivered.",
+        opener_url=EVIDENCE_NOTHING,
+    )
+
+    # Still inside the window: blocked.
+    with direct_vm.expect_revert(
+        "[EXPECTED] dispute cannot be resolved before the counterparty responds"
+    ):
+        contract.resolve_dispute(escrow_id)
+
+    # One second past the 24-hour deadline: resolvable, even though
+    # the worker never responded.
+    direct_vm.warp("2026-11-17T00:00:01Z")
+    _mock_evidence(direct_vm, EVIDENCE_NOTHING, PAGE_NOTHING)
+    _mock_verdict(direct_vm, False, False)
+    _resolve(direct_vm, contract, escrow_id)
+    dispute = contract.get_dispute(escrow_id)
+    assert dispute["resolved"] is True
+    assert dispute["worker_share"] == 0
+    assert contract.get_escrow(escrow_id)["status"] == "RESOLVED"
+
+
 def test_resolve_full_payment_when_delivered_and_met(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
@@ -380,8 +475,10 @@ def test_resolve_refund_when_not_delivered(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
     # The worker never responds: the round judges on the payer's case
-    # and the agreement alone.
+    # and the agreement alone — but only after the 24-hour response
+    # deadline passes.
     escrow_id = _setup_dispute(
         direct_vm, contract, direct_alice, direct_bob,
         opener=direct_alice,
@@ -389,6 +486,7 @@ def test_resolve_refund_when_not_delivered(
         opener_url=EVIDENCE_NOTHING,
     )
 
+    direct_vm.warp("2026-11-17T00:00:01Z")
     _mock_evidence(direct_vm, EVIDENCE_NOTHING, PAGE_NOTHING)
     _mock_verdict(direct_vm, False, False)
     _resolve(direct_vm, contract, escrow_id)
@@ -404,6 +502,7 @@ def test_validator_disagrees_when_a_fact_differs(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
     escrow_id = _setup_dispute(
         direct_vm, contract, direct_alice, direct_bob,
         opener=direct_bob,
@@ -411,6 +510,7 @@ def test_validator_disagrees_when_a_fact_differs(
         opener_url=EVIDENCE_DELIVERED,
     )
 
+    direct_vm.warp("2026-11-17T00:00:01Z")
     _mock_evidence(direct_vm, EVIDENCE_DELIVERED, PAGE_DELIVERED)
     _mock_verdict(direct_vm, True, True)
     _resolve(direct_vm, contract, escrow_id)
@@ -426,12 +526,18 @@ def test_resolve_fails_cleanly_when_evidence_unreachable(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
     escrow_id = _setup_dispute(
         direct_vm, contract, direct_alice, direct_bob,
         opener=direct_alice,
         opener_statement="Nothing was delivered.",
         opener_url=EVIDENCE_NOTHING,
     )
+
+    # The worker never responds, so resolve only after the response
+    # deadline — otherwise the gate, not the evidence fetch, is what
+    # reverts.
+    direct_vm.warp("2026-11-17T00:00:01Z")
 
     # 404: the URL itself is wrong, no point retrying it.
     _mock_evidence_status(direct_vm, EVIDENCE_NOTHING, 404)
@@ -457,12 +563,18 @@ def test_resolve_fails_cleanly_when_llm_verdict_malformed(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
     escrow_id = _setup_dispute(
         direct_vm, contract, direct_alice, direct_bob,
         opener=direct_bob,
         opener_statement="I delivered the page.",
         opener_url=EVIDENCE_DELIVERED,
     )
+
+    # The payer never responds, so resolve only after the response
+    # deadline — otherwise the gate, not the verdict shape, is what
+    # reverts.
+    direct_vm.warp("2026-11-17T00:00:01Z")
 
     # delivered is not a boolean.
     _mock_evidence(direct_vm, EVIDENCE_DELIVERED, PAGE_DELIVERED)
@@ -519,10 +631,14 @@ def test_string_ids_accepted_from_studio_form(
 
 def test_views_and_stats(direct_vm, direct_deploy, direct_alice, direct_bob):
     contract = direct_deploy("contracts/EscrowDisputeMediation.py")
+    direct_vm.warp("2026-11-16T00:00:00Z")
     first = _create(direct_vm, contract, direct_alice, direct_bob)
     second = _create(direct_vm, contract, direct_alice, direct_bob, amount=ONE_GEN)
 
     _open_dispute(direct_vm, contract, direct_bob, first, "Delivered.", EVIDENCE_DELIVERED)
+    # The payer never responds, so resolve only after the response
+    # deadline.
+    direct_vm.warp("2026-11-17T00:00:01Z")
     _mock_evidence(direct_vm, EVIDENCE_DELIVERED, PAGE_DELIVERED)
     _mock_verdict(direct_vm, True, True)
     _resolve(direct_vm, contract, first)
