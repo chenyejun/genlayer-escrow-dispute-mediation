@@ -13,7 +13,7 @@
   (`1zr6nqk...`); the contract targets the boilerplate's runner, and
   moving to a newer runner requires the renamed APIs, not just the hash —
   do not change the hash alone.
-- Direct tests: 18 passed
+- Direct tests: 21 passed
   (`./.venv/bin/python -m pytest tests/direct -q`).
 
 ## Constructor
@@ -43,16 +43,23 @@ than the payer's, and note its address. The checklist below calls it
 validators can fetch. Create three public GitHub gists with exactly
 these contents, and fill in the URLs below before running step 4:
 
-1. `delivery-evidence.md` — the fully delivered job:
+1. `delivery-evidence.md` — the fully delivered job (updated 2026-11-16: the
+   validators twice ruled the old text-only version insufficient, so the
+   evidence now cites a real live page and a screenshot):
 
 ```text
 # Delivery: landing page
 
-The landing page is live at the agreed URL. It has a signup form and
-email confirmation works: submitting the form sends a confirmation
-email. Screenshots of the form and the confirmation email are attached
-below.
+The landing page is live at https://chenyejun.github.io/landing-page-demo/.
+
+It has a signup form (email field + "Join the waitlist" button). Submitting the form sends a confirmation email: the page shows "Thanks! Please check your inbox — a confirmation email is on its way." and a confirmation email is sent to the submitted address with the subject "Please confirm your email".
+
+Screenshot of the live page:
+https://raw.githubusercontent.com/chenyejun/landing-page-demo/main/screenshot.png
 ```
+
+   The page itself lives in https://github.com/chenyejun/landing-page-demo
+   (GitHub Pages, `index.html` + `screenshot.png` at the repo root).
 
 2. `partial-delivery.md` — the page is up, email confirmation is missing:
 
@@ -175,14 +182,27 @@ reverts with `[LLM_ERROR]`, retry once.
    `delivered: true`, `met_agreement: true`, `worker_share: 100`.
    On the explorer, the worker gained the full 1 GEN.
 
-### 6. Dispute — nothing delivered, worker never responds (0%)
+### 6. Dispute — nothing delivered, response gate (0%)
 
 1. `create_escrow(<WORKER>, <same agreement>, <now + 7 days>)` with
    **1 GEN** → returns `5`.
 2. From the **payer** account, `open_dispute(5, "Nothing was
    delivered.", <GIST_NOTHING>)` — expected: succeeds.
-3. Do **not** submit a response. Call `resolve_dispute(5)` — expected:
-   succeeds. `get_dispute(5)` → `delivered: false`,
+   `get_dispute(5)` → `awaiting` is `<WORKER>`,
+   `response_deadline` is `disputed_at + 86400` (24 hours).
+3. Immediately call `resolve_dispute(5)` — expected: reverts with
+   `[EXPECTED]` (`dispute cannot be resolved before the counterparty
+   responds or the response deadline passes`). This is the response
+   gate: the opener's case alone never settles the payout while the
+   counterparty is still awaited inside its window.
+4. From the **worker** account, `submit_response(5, "No work was
+   done.", "")` — expected: succeeds. `get_dispute(5)` → `awaiting`
+   is the zero address. (The never-responds path — resolving after
+   the 24-hour deadline with no response — is covered by the direct
+   tests via time warp; on chain it resolves the same way once the
+   deadline passes.)
+5. Call `resolve_dispute(5)` — expected: succeeds.
+   `get_dispute(5)` → `delivered: false`,
    `met_agreement: false`, `worker_share: 0`, `resolved: true`. On
    the explorer, the payer regained the full 1 GEN and the worker
    gained nothing.
